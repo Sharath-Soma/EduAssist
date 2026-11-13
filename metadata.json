@@ -1,0 +1,6 @@
+{
+  "name": "EduAssist",
+  "description": "AI-powered educational assistant for school (Classes 6–12) and college (Degree, B.Tech, Engineering) students combining PDF-grounded institutional RAG and general academic tutoring.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
