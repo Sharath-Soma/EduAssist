@@ -22,6 +22,7 @@ import type {
 } from '../../shared/types/knowledge.ts';
 import { streamAssistantQuery } from '../services/apiClient.ts';
 import { MarkdownContent } from './MarkdownContent.tsx';
+import { SourceCitations } from './SourceCitations.tsx';
 
 interface AssistantWorkspaceProps {
   academicTrack: AcademicTrack;
@@ -697,41 +698,7 @@ export function AssistantWorkspace({
                   <MarkdownContent content={resp.answer} />
                 )}
 
-                {resp.sources.length > 0 && (
-                  <div className="border-t border-slate-200 pt-4 space-y-3">
-                    <h2 className="text-xs font-semibold text-slate-700">
-                      Source Citations ({resp.sources.length})
-                    </h2>
-                    <div className="space-y-2.5">
-                      {resp.sources.map((source, index) => (
-                        <div
-                          key={`${source.documentId}-${source.page}-${index}`}
-                          className="rounded-lg border border-slate-200 bg-slate-50/70 p-3 space-y-1.5"
-                        >
-                          <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
-                            <span className="font-semibold text-slate-900 [overflow-wrap:anywhere]">
-                              {source.title}
-                            </span>
-                            <div className="flex items-center gap-2 text-slate-600 tabular-nums shrink-0">
-                              <span>Page {source.page}</span>
-                              {typeof source.similarityScore === 'number' && (
-                                <>
-                                  <span aria-hidden="true">·</span>
-                                  <span>
-                                    Score {source.similarityScore.toFixed(2)}
-                                  </span>
-                                </>
-                              )}
-                            </div>
-                          </div>
-                          <p className="text-xs leading-relaxed text-slate-700 [overflow-wrap:anywhere]">
-                            {source.excerpt}
-                          </p>
-                        </div>
-                      ))}
-                    </div>
-                  </div>
-                )}
+                <SourceCitations messageId={message.id} sources={resp.sources} />
               </article>
             );
           })}
