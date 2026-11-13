@@ -108,6 +108,16 @@ function classifyAssistantError(error: unknown): { statusCode: number; error: st
         error: 'The AI service is temporarily unavailable. Please wait a moment and click Retry.',
       };
     }
+    if (
+      msg.includes('timed out') ||
+      msg.includes('timeout') ||
+      error.name === 'TimeoutError'
+    ) {
+      return {
+        statusCode: 504,
+        error: 'The AI request timed out. Please wait a moment and try again.',
+      };
+    }
     return { statusCode: 500, error: error.message };
   }
   return { statusCode: 500, error: 'Internal server error.' };
@@ -116,11 +126,23 @@ function classifyAssistantError(error: unknown): { statusCode: number; error: st
 export const assistantRouter = Router();
 
 assistantRouter.post('/assistant/query', async (req: Request, res: Response, next) => {
+  const abortController = new AbortController();
+  res.on('close', () => {
+    if (!res.writableEnded) {
+      abortController.abort();
+    }
+  });
+
   try {
     const parsed = parseAssistantBody(req);
-    const result = await ragPipeline.answerQuery(parsed);
-    res.status(200).json(result);
+    const result = await ragPipeline.answerQuery(parsed, abortController.signal);
+    if (!res.writableEnded) {
+      res.status(200).json(result);
+    }
   } catch (error) {
+    if (abortController.signal.aborted) {
+      return;
+    }
     if (
       error instanceof RagValidationError ||
       error instanceof CollectionNotFoundError
@@ -154,10 +176,12 @@ assistantRouter.post('/assistant/query/stream', async (req: Request, res: Respon
   res.setHeader('X-Accel-Buffering', 'no');
   res.flushHeaders?.();
 
+  const abortController = new AbortController();
   let clientClosed = false;
   res.on('close', () => {
     if (!res.writableEnded) {
       clientClosed = true;
+      abortController.abort();
     }
   });
 
@@ -169,8 +193,11 @@ assistantRouter.post('/assistant/query/stream', async (req: Request, res: Respon
   };
 
   try {
-    await ragPipeline.answerQueryStream(parsed, emit);
+    await ragPipeline.answerQueryStream(parsed, emit, abortController.signal);
   } catch (error) {
+    if (clientClosed || abortController.signal.aborted) {
+      return;
+    }
     const mapped = classifyAssistantError(error);
     emit({
       type: 'error',

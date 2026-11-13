@@ -15,8 +15,10 @@ import {
   classifyQueryIntent,
   generateEducationalAnswer,
   generateInstitutionalAnswer,
+  type IntentClassification,
   streamEducationalAnswer,
   streamInstitutionalAnswer,
+  tryFastDeterministicRoute,
 } from './answerGenerator.ts';
 import {
   CollectionNotFoundError,
@@ -89,12 +91,35 @@ function mapChunksToSources(
   return deduped;
 }
 
+interface RagTimingMetrics {
+  mode: KnowledgeSourceMode;
+  route: string;
+  streaming: boolean;
+  totalMs: number;
+  routeMs: number;
+  embedMs: number;
+  retrievalMs: number;
+  llmMs: number;
+  chunks: number;
+  embedCacheHit: boolean;
+}
+
+function logRagTiming(metrics: RagTimingMetrics): void {
+  console.log(
+    `[RAG Timing] mode=${metrics.mode} route=${metrics.route} stream=${metrics.streaming} totalMs=${metrics.totalMs} routeMs=${metrics.routeMs} embedMs=${metrics.embedMs} retrievalMs=${metrics.retrievalMs} llmMs=${metrics.llmMs} chunks=${metrics.chunks} embedCacheHit=${metrics.embedCacheHit}`,
+  );
+}
+
 export interface RagPipeline {
   readonly isActive: boolean;
-  answerQuery(request: AssistantQueryRequest): Promise<AssistantQueryResponse>;
+  answerQuery(
+    request: AssistantQueryRequest,
+    signal?: AbortSignal,
+  ): Promise<AssistantQueryResponse>;
   answerQueryStream(
     request: AssistantQueryRequest,
     emit: (event: AssistantStreamEvent) => void,
+    signal?: AbortSignal,
   ): Promise<AssistantQueryResponse>;
 }
 
@@ -129,10 +154,12 @@ export class ActiveRagPipeline implements RagPipeline {
       if (!collection) {
         throw new CollectionNotFoundError('Selected institution collection was not found.');
       }
-      const docs = await documentStore.listDocumentsByCollection(collection.id);
-      indexedDocIds = new Set(
-        docs.filter((doc) => doc.status === 'indexed').map((doc) => doc.id),
-      );
+      if (mode !== 'educational') {
+        const docs = await documentStore.listDocumentsByCollection(collection.id);
+        indexedDocIds = new Set(
+          docs.filter((doc) => doc.status === 'indexed').map((doc) => doc.id),
+        );
+      }
     }
 
     if (mode === 'institutional' && !collection) {
@@ -145,6 +172,77 @@ export class ActiveRagPipeline implements RagPipeline {
     return { query, mode, academicTrack, history, collection, indexedDocIds };
   }
 
+  private async resolveIntent(params: {
+    query: string;
+    collectionName: string | null;
+    hasIndexedDocuments: boolean;
+    history: ConversationMessage[];
+    signal?: AbortSignal;
+    onRoutingStart?: () => void;
+  }): Promise<{ intent: IntentClassification; routeMs: number }> {
+    const routeStart = performance.now();
+    const fastRoute = tryFastDeterministicRoute(params.query, params.history);
+    if (fastRoute) {
+      return {
+        intent: fastRoute,
+        routeMs: Math.round(performance.now() - routeStart),
+      };
+    }
+
+    params.onRoutingStart?.();
+    const intent = await classifyQueryIntent({
+      query: params.query,
+      collectionName: params.collectionName,
+      hasIndexedDocuments: params.hasIndexedDocuments,
+      history: params.history,
+      signal: params.signal,
+    });
+
+    return {
+      intent,
+      routeMs: Math.round(performance.now() - routeStart),
+    };
+  }
+
+  private async retrieveChunks(params: {
+    query: string;
+    collection: InstitutionCollection | null;
+    indexedDocIds: Set<string>;
+    signal?: AbortSignal;
+  }): Promise<{
+    retrieval: RetrievalResult | undefined;
+    embedMs: number;
+    retrievalMs: number;
+    embedCacheHit: boolean;
+  }> {
+    if (!params.collection || params.indexedDocIds.size === 0) {
+      return {
+        retrieval: undefined,
+        embedMs: 0,
+        retrievalMs: 0,
+        embedCacheHit: false,
+      };
+    }
+
+    const retrievalStart = performance.now();
+    const retrieval = await vectorRetriever.retrieve({
+      collectionId: params.collection.id,
+      query: params.query,
+      topK: DEFAULT_RETRIEVAL_TOP_K,
+      minScore: DEFAULT_MIN_SIMILARITY,
+      preloadedCollection: params.collection,
+      preloadedIndexedDocIds: params.indexedDocIds,
+      signal: params.signal,
+    });
+
+    return {
+      retrieval,
+      embedMs: retrieval.embedMs,
+      retrievalMs: Math.round(performance.now() - retrievalStart),
+      embedCacheHit: retrieval.embedCacheHit,
+    };
+  }
+
   private async runInstitutionalFlow(params: {
     query: string;
     collection: InstitutionCollection | null;
@@ -152,6 +250,7 @@ export class ActiveRagPipeline implements RagPipeline {
     history: ConversationMessage[];
     preloadedRetrieval?: RetrievalResult;
     streamTo?: (delta: string) => void;
+    signal?: AbortSignal;
   }): Promise<{
     hasEvidence: boolean;
     answer: string;
@@ -159,6 +258,10 @@ export class ActiveRagPipeline implements RagPipeline {
     retrievedChunks: number;
     topK: number;
     minSimilarity: number;
+    embedMs: number;
+    retrievalMs: number;
+    llmMs: number;
+    embedCacheHit: boolean;
   }> {
     if (!params.collection) {
       const msg =
@@ -171,21 +274,32 @@ export class ActiveRagPipeline implements RagPipeline {
         retrievedChunks: 0,
         topK: DEFAULT_RETRIEVAL_TOP_K,
         minSimilarity: DEFAULT_MIN_SIMILARITY,
+        embedMs: 0,
+        retrievalMs: 0,
+        llmMs: 0,
+        embedCacheHit: false,
       };
     }
 
-    const retrieval =
-      params.preloadedRetrieval ??
-      (await vectorRetriever.retrieve({
-        collectionId: params.collection.id,
-        query: params.query,
-        topK: DEFAULT_RETRIEVAL_TOP_K,
-        minScore: DEFAULT_MIN_SIMILARITY,
-        preloadedCollection: params.collection,
-        preloadedIndexedDocIds: params.indexedDocIds,
-      }));
+    let retrieval = params.preloadedRetrieval;
+    let embedMs = retrieval?.embedMs ?? 0;
+    let retrievalMs = retrieval ? retrieval.embedMs + retrieval.vectorSearchMs : 0;
+    let embedCacheHit = retrieval?.embedCacheHit ?? false;
 
-    if (retrieval.indexedDocumentCount === 0) {
+    if (!retrieval) {
+      const retrieved = await this.retrieveChunks({
+        query: params.query,
+        collection: params.collection,
+        indexedDocIds: params.indexedDocIds,
+        signal: params.signal,
+      });
+      retrieval = retrieved.retrieval;
+      embedMs = retrieved.embedMs;
+      retrievalMs = retrieved.retrievalMs;
+      embedCacheHit = retrieved.embedCacheHit;
+    }
+
+    if (!retrieval || retrieval.indexedDocumentCount === 0) {
       const msg = `No indexed PDF documents are available in "${params.collection.name}" yet. Upload and process institutional PDFs before querying official policies.`;
       params.streamTo?.(msg);
       return {
@@ -193,8 +307,12 @@ export class ActiveRagPipeline implements RagPipeline {
         answer: msg,
         sources: [],
         retrievedChunks: 0,
-        topK: retrieval.topK,
-        minSimilarity: retrieval.minScore,
+        topK: retrieval?.topK ?? DEFAULT_RETRIEVAL_TOP_K,
+        minSimilarity: retrieval?.minScore ?? DEFAULT_MIN_SIMILARITY,
+        embedMs,
+        retrievalMs,
+        llmMs: 0,
+        embedCacheHit,
       };
     }
 
@@ -208,9 +326,14 @@ export class ActiveRagPipeline implements RagPipeline {
         retrievedChunks: 0,
         topK: retrieval.topK,
         minSimilarity: retrieval.minScore,
+        embedMs,
+        retrievalMs,
+        llmMs: 0,
+        embedCacheHit,
       };
     }
 
+    const llmStart = performance.now();
     const generated = params.streamTo
       ? await streamInstitutionalAnswer({
           query: params.query,
@@ -218,13 +341,16 @@ export class ActiveRagPipeline implements RagPipeline {
           chunks: retrieval.chunks,
           history: params.history,
           onTextChunk: params.streamTo,
+          signal: params.signal,
         })
       : await generateInstitutionalAnswer({
           query: params.query,
           collectionName: params.collection.name,
           chunks: retrieval.chunks,
           history: params.history,
+          signal: params.signal,
         });
+    const llmMs = Math.round(performance.now() - llmStart);
 
     if (!generated.hasSufficientEvidence) {
       return {
@@ -234,6 +360,10 @@ export class ActiveRagPipeline implements RagPipeline {
         retrievedChunks: retrieval.chunks.length,
         topK: retrieval.topK,
         minSimilarity: retrieval.minScore,
+        embedMs,
+        retrievalMs,
+        llmMs,
+        embedCacheHit,
       };
     }
 
@@ -246,10 +376,18 @@ export class ActiveRagPipeline implements RagPipeline {
       retrievedChunks: retrieval.chunks.length,
       topK: retrieval.topK,
       minSimilarity: retrieval.minScore,
+      embedMs,
+      retrievalMs,
+      llmMs,
+      embedCacheHit,
     };
   }
 
-  async answerQuery(request: AssistantQueryRequest): Promise<AssistantQueryResponse> {
+  async answerQuery(
+    request: AssistantQueryRequest,
+    signal?: AbortSignal,
+  ): Promise<AssistantQueryResponse> {
+    const requestStart = performance.now();
     const { query, mode, academicTrack, history, collection, indexedDocIds } =
       await this.resolveContext(request);
 
@@ -259,6 +397,20 @@ export class ActiveRagPipeline implements RagPipeline {
         collection,
         indexedDocIds,
         history,
+        signal,
+      });
+
+      logRagTiming({
+        mode,
+        route: 'institutional',
+        streaming: false,
+        totalMs: Math.round(performance.now() - requestStart),
+        routeMs: 0,
+        embedMs: inst.embedMs,
+        retrievalMs: inst.retrievalMs,
+        llmMs: inst.llmMs,
+        chunks: inst.retrievedChunks,
+        embedCacheHit: inst.embedCacheHit,
       });
 
       return {
@@ -278,10 +430,26 @@ export class ActiveRagPipeline implements RagPipeline {
     }
 
     if (mode === 'educational') {
+      const llmStart = performance.now();
       const educationalAnswer = await generateEducationalAnswer({
         query,
         academicTrack,
         history,
+        signal,
+      });
+      const llmMs = Math.round(performance.now() - llmStart);
+
+      logRagTiming({
+        mode,
+        route: 'educational',
+        streaming: false,
+        totalMs: Math.round(performance.now() - requestStart),
+        routeMs: 0,
+        embedMs: 0,
+        retrievalMs: 0,
+        llmMs,
+        chunks: 0,
+        embedCacheHit: false,
       });
 
       return {
@@ -300,34 +468,31 @@ export class ActiveRagPipeline implements RagPipeline {
       };
     }
 
-    const retrievalPromise =
-      collection && indexedDocIds.size > 0
-        ? vectorRetriever
-            .retrieve({
-              collectionId: collection.id,
-              query,
-              topK: DEFAULT_RETRIEVAL_TOP_K,
-              minScore: DEFAULT_MIN_SIMILARITY,
-              preloadedCollection: collection,
-              preloadedIndexedDocIds: indexedDocIds,
-            })
-            .catch(() => undefined)
-        : Promise.resolve(undefined);
-
-    const [intent, speculativeRetrieval] = await Promise.all([
-      classifyQueryIntent({
-        query,
-        collectionName: collection?.name ?? null,
-        hasIndexedDocuments: indexedDocIds.size > 0,
-        history,
-      }),
-      retrievalPromise,
-    ]);
+    const { intent, routeMs } = await this.resolveIntent({
+      query,
+      collectionName: collection?.name ?? null,
+      hasIndexedDocuments: indexedDocIds.size > 0,
+      history,
+      signal,
+    });
 
     if (intent.route === 'ambiguous') {
       const clarification =
         intent.clarificationPrompt ||
         'Could you clarify whether you are asking about an official institutional rule from your uploaded documents, or an academic concept explanation?';
+
+      logRagTiming({
+        mode,
+        route: 'ambiguous',
+        streaming: false,
+        totalMs: Math.round(performance.now() - requestStart),
+        routeMs,
+        embedMs: 0,
+        retrievalMs: 0,
+        llmMs: 0,
+        chunks: 0,
+        embedCacheHit: false,
+      });
 
       return {
         answer: clarification,
@@ -351,7 +516,20 @@ export class ActiveRagPipeline implements RagPipeline {
         collection,
         indexedDocIds,
         history,
-        preloadedRetrieval: speculativeRetrieval,
+        signal,
+      });
+
+      logRagTiming({
+        mode,
+        route: 'institutional',
+        streaming: false,
+        totalMs: Math.round(performance.now() - requestStart),
+        routeMs,
+        embedMs: inst.embedMs,
+        retrievalMs: inst.retrievalMs,
+        llmMs: inst.llmMs,
+        chunks: inst.retrievedChunks,
+        embedCacheHit: inst.embedCacheHit,
       });
 
       return {
@@ -371,10 +549,26 @@ export class ActiveRagPipeline implements RagPipeline {
     }
 
     if (intent.route === 'educational') {
+      const llmStart = performance.now();
       const educationalAnswer = await generateEducationalAnswer({
         query,
         academicTrack,
         history,
+        signal,
+      });
+      const llmMs = Math.round(performance.now() - llmStart);
+
+      logRagTiming({
+        mode,
+        route: 'educational',
+        streaming: false,
+        totalMs: Math.round(performance.now() - requestStart),
+        routeMs,
+        embedMs: 0,
+        retrievalMs: 0,
+        llmMs,
+        chunks: 0,
+        embedCacheHit: false,
       });
 
       return {
@@ -396,20 +590,39 @@ export class ActiveRagPipeline implements RagPipeline {
     const instQuery = intent.institutionalSubQuery || query;
     const eduQuery = intent.educationalSubQuery || query;
 
+    const llmEduStart = performance.now();
     const [inst, educationalAnswer] = await Promise.all([
       this.runInstitutionalFlow({
         query: instQuery,
         collection,
         indexedDocIds,
         history,
-        preloadedRetrieval: instQuery === query ? speculativeRetrieval : undefined,
+        signal,
       }),
       generateEducationalAnswer({
         query: eduQuery,
         academicTrack,
         history,
+        signal,
       }),
     ]);
+    const parallelLlmMs = Math.max(
+      inst.llmMs,
+      Math.round(performance.now() - llmEduStart),
+    );
+
+    logRagTiming({
+      mode,
+      route: 'both',
+      streaming: false,
+      totalMs: Math.round(performance.now() - requestStart),
+      routeMs,
+      embedMs: inst.embedMs,
+      retrievalMs: inst.retrievalMs,
+      llmMs: parallelLlmMs,
+      chunks: inst.retrievedChunks,
+      embedCacheHit: inst.embedCacheHit,
+    });
 
     const combinedMarkdown = [
       '### Institutional Knowledge',
@@ -438,44 +651,53 @@ export class ActiveRagPipeline implements RagPipeline {
   async answerQueryStream(
     request: AssistantQueryRequest,
     emit: (event: AssistantStreamEvent) => void,
+    signal?: AbortSignal,
   ): Promise<AssistantQueryResponse> {
+    const requestStart = performance.now();
     const { query, mode, academicTrack, history, collection, indexedDocIds } =
       await this.resolveContext(request);
 
     if (mode === 'institutional') {
-      emit({
-        type: 'status',
-        phase: 'retrieving',
-        message: 'Searching institutional PDFs...',
-      });
+      let preloadedRetrieval: RetrievalResult | undefined;
+      let embedMs = 0;
+      let retrievalMs = 0;
+      let embedCacheHit = false;
 
-      const retrieval = collection
-        ? await vectorRetriever.retrieve({
-            collectionId: collection.id,
-            query,
-            topK: DEFAULT_RETRIEVAL_TOP_K,
-            minScore: DEFAULT_MIN_SIMILARITY,
-            preloadedCollection: collection,
-            preloadedIndexedDocIds: indexedDocIds,
-          })
-        : undefined;
+      if (collection && indexedDocIds.size > 0) {
+        emit({
+          type: 'status',
+          phase: 'retrieving',
+          message: 'Searching relevant documents',
+        });
+
+        const retrieved = await this.retrieveChunks({
+          query,
+          collection,
+          indexedDocIds,
+          signal,
+        });
+        preloadedRetrieval = retrieved.retrieval;
+        embedMs = retrieved.embedMs;
+        retrievalMs = retrieved.retrievalMs;
+        embedCacheHit = retrieved.embedCacheHit;
+      }
 
       emit({
         type: 'meta',
         knowledgeType: 'institutional',
         retrievalMetadata: {
-          retrievedChunks: retrieval?.chunks.length ?? 0,
+          retrievedChunks: preloadedRetrieval?.chunks.length ?? 0,
           collectionId: collection?.id ?? null,
           collectionName: collection?.name ?? null,
-          topK: retrieval?.topK ?? DEFAULT_RETRIEVAL_TOP_K,
-          minSimilarity: retrieval?.minScore ?? DEFAULT_MIN_SIMILARITY,
+          topK: preloadedRetrieval?.topK ?? DEFAULT_RETRIEVAL_TOP_K,
+          minSimilarity: preloadedRetrieval?.minScore ?? DEFAULT_MIN_SIMILARITY,
         },
       });
 
       emit({
         type: 'status',
         phase: 'generating',
-        message: 'Generating grounded institutional answer...',
+        message: 'Preparing answer',
       });
 
       const inst = await this.runInstitutionalFlow({
@@ -483,8 +705,22 @@ export class ActiveRagPipeline implements RagPipeline {
         collection,
         indexedDocIds,
         history,
-        preloadedRetrieval: retrieval,
+        preloadedRetrieval,
         streamTo: (text) => emit({ type: 'chunk', section: 'main', text }),
+        signal,
+      });
+
+      logRagTiming({
+        mode,
+        route: 'institutional',
+        streaming: true,
+        totalMs: Math.round(performance.now() - requestStart),
+        routeMs: 0,
+        embedMs: preloadedRetrieval ? embedMs : inst.embedMs,
+        retrievalMs: preloadedRetrieval ? retrievalMs : inst.retrievalMs,
+        llmMs: inst.llmMs,
+        chunks: inst.retrievedChunks,
+        embedCacheHit: preloadedRetrieval ? embedCacheHit : inst.embedCacheHit,
       });
 
       const finalResponse: AssistantQueryResponse = {
@@ -522,14 +758,30 @@ export class ActiveRagPipeline implements RagPipeline {
       emit({
         type: 'status',
         phase: 'generating',
-        message: 'Generating educational explanation...',
+        message: 'Preparing answer',
       });
 
+      const llmStart = performance.now();
       const educationalAnswer = await streamEducationalAnswer({
         query,
         academicTrack,
         history,
         onTextChunk: (text) => emit({ type: 'chunk', section: 'main', text }),
+        signal,
+      });
+      const llmMs = Math.round(performance.now() - llmStart);
+
+      logRagTiming({
+        mode,
+        route: 'educational',
+        streaming: true,
+        totalMs: Math.round(performance.now() - requestStart),
+        routeMs: 0,
+        embedMs: 0,
+        retrievalMs: 0,
+        llmMs,
+        chunks: 0,
+        embedCacheHit: false,
       });
 
       const finalResponse: AssistantQueryResponse = {
@@ -551,38 +803,20 @@ export class ActiveRagPipeline implements RagPipeline {
       return finalResponse;
     }
 
-    emit({
-      type: 'status',
-      phase: 'routing',
-      message:
-        indexedDocIds.size > 0
-          ? 'Routing query and searching institutional PDFs...'
-          : 'Analyzing query...',
+    const { intent, routeMs } = await this.resolveIntent({
+      query,
+      collectionName: collection?.name ?? null,
+      hasIndexedDocuments: indexedDocIds.size > 0,
+      history,
+      signal,
+      onRoutingStart: () => {
+        emit({
+          type: 'status',
+          phase: 'routing',
+          message: 'Understanding question',
+        });
+      },
     });
-
-    const retrievalPromise =
-      collection && indexedDocIds.size > 0
-        ? vectorRetriever
-            .retrieve({
-              collectionId: collection.id,
-              query,
-              topK: DEFAULT_RETRIEVAL_TOP_K,
-              minScore: DEFAULT_MIN_SIMILARITY,
-              preloadedCollection: collection,
-              preloadedIndexedDocIds: indexedDocIds,
-            })
-            .catch(() => undefined)
-        : Promise.resolve(undefined);
-
-    const [intent, speculativeRetrieval] = await Promise.all([
-      classifyQueryIntent({
-        query,
-        collectionName: collection?.name ?? null,
-        hasIndexedDocuments: indexedDocIds.size > 0,
-        history,
-      }),
-      retrievalPromise,
-    ]);
 
     if (intent.route === 'ambiguous') {
       const clarification =
@@ -604,6 +838,19 @@ export class ActiveRagPipeline implements RagPipeline {
         },
       };
 
+      logRagTiming({
+        mode,
+        route: 'ambiguous',
+        streaming: true,
+        totalMs: Math.round(performance.now() - requestStart),
+        routeMs,
+        embedMs: 0,
+        retrievalMs: 0,
+        llmMs: 0,
+        chunks: 0,
+        embedCacheHit: false,
+      });
+
       emit({
         type: 'meta',
         knowledgeType: 'clarification',
@@ -614,22 +861,97 @@ export class ActiveRagPipeline implements RagPipeline {
       return finalResponse;
     }
 
+    if (intent.route === 'educational') {
+      const retrievalMeta = {
+        retrievedChunks: 0,
+        collectionId: collection?.id ?? null,
+        collectionName: collection?.name ?? null,
+        topK: DEFAULT_RETRIEVAL_TOP_K,
+        minSimilarity: DEFAULT_MIN_SIMILARITY,
+      };
+      emit({ type: 'meta', knowledgeType: 'educational', retrievalMetadata: retrievalMeta });
+      emit({
+        type: 'status',
+        phase: 'generating',
+        message: 'Preparing answer',
+      });
+
+      const llmStart = performance.now();
+      const educationalAnswer = await streamEducationalAnswer({
+        query,
+        academicTrack,
+        history,
+        onTextChunk: (text) => emit({ type: 'chunk', section: 'main', text }),
+        signal,
+      });
+      const llmMs = Math.round(performance.now() - llmStart);
+
+      logRagTiming({
+        mode,
+        route: 'educational',
+        streaming: true,
+        totalMs: Math.round(performance.now() - requestStart),
+        routeMs,
+        embedMs: 0,
+        retrievalMs: 0,
+        llmMs,
+        chunks: 0,
+        embedCacheHit: false,
+      });
+
+      const finalResponse: AssistantQueryResponse = {
+        answer: educationalAnswer,
+        knowledgeType: 'educational',
+        institutionalSection: null,
+        educationalSection: educationalAnswer,
+        sources: [],
+        retrievalMetadata: retrievalMeta,
+      };
+
+      emit({ type: 'done', response: finalResponse });
+      return finalResponse;
+    }
+
     if (intent.route === 'institutional') {
+      let preloadedRetrieval: RetrievalResult | undefined;
+      let embedMs = 0;
+      let retrievalMs = 0;
+      let embedCacheHit = false;
+
+      if (collection && indexedDocIds.size > 0) {
+        emit({
+          type: 'status',
+          phase: 'retrieving',
+          message: 'Searching relevant documents',
+        });
+
+        const retrieved = await this.retrieveChunks({
+          query,
+          collection,
+          indexedDocIds,
+          signal,
+        });
+        preloadedRetrieval = retrieved.retrieval;
+        embedMs = retrieved.embedMs;
+        retrievalMs = retrieved.retrievalMs;
+        embedCacheHit = retrieved.embedCacheHit;
+      }
+
       emit({
         type: 'meta',
         knowledgeType: 'institutional',
         retrievalMetadata: {
-          retrievedChunks: speculativeRetrieval?.chunks.length ?? 0,
+          retrievedChunks: preloadedRetrieval?.chunks.length ?? 0,
           collectionId: collection?.id ?? null,
           collectionName: collection?.name ?? null,
-          topK: speculativeRetrieval?.topK ?? DEFAULT_RETRIEVAL_TOP_K,
-          minSimilarity: speculativeRetrieval?.minScore ?? DEFAULT_MIN_SIMILARITY,
+          topK: preloadedRetrieval?.topK ?? DEFAULT_RETRIEVAL_TOP_K,
+          minSimilarity: preloadedRetrieval?.minScore ?? DEFAULT_MIN_SIMILARITY,
         },
       });
       emit({
         type: 'status',
         phase: 'generating',
-        message: 'Generating grounded institutional answer...',
+        message: 'Preparing answer',
       });
 
       const inst = await this.runInstitutionalFlow({
@@ -637,8 +959,22 @@ export class ActiveRagPipeline implements RagPipeline {
         collection,
         indexedDocIds,
         history,
-        preloadedRetrieval: speculativeRetrieval,
+        preloadedRetrieval,
         streamTo: (text) => emit({ type: 'chunk', section: 'main', text }),
+        signal,
+      });
+
+      logRagTiming({
+        mode,
+        route: 'institutional',
+        streaming: true,
+        totalMs: Math.round(performance.now() - requestStart),
+        routeMs,
+        embedMs: preloadedRetrieval ? embedMs : inst.embedMs,
+        retrievalMs: preloadedRetrieval ? retrievalMs : inst.retrievalMs,
+        llmMs: inst.llmMs,
+        chunks: inst.retrievedChunks,
+        embedCacheHit: preloadedRetrieval ? embedCacheHit : inst.embedCacheHit,
       });
 
       const finalResponse: AssistantQueryResponse = {
@@ -660,58 +996,32 @@ export class ActiveRagPipeline implements RagPipeline {
       return finalResponse;
     }
 
-    if (intent.route === 'educational') {
-      const retrievalMeta = {
-        retrievedChunks: 0,
-        collectionId: collection?.id ?? null,
-        collectionName: collection?.name ?? null,
-        topK: DEFAULT_RETRIEVAL_TOP_K,
-        minSimilarity: DEFAULT_MIN_SIMILARITY,
-      };
-      emit({ type: 'meta', knowledgeType: 'educational', retrievalMetadata: retrievalMeta });
-      emit({
-        type: 'status',
-        phase: 'generating',
-        message: 'Generating educational explanation...',
-      });
-
-      const educationalAnswer = await streamEducationalAnswer({
-        query,
-        academicTrack,
-        history,
-        onTextChunk: (text) => emit({ type: 'chunk', section: 'main', text }),
-      });
-
-      const finalResponse: AssistantQueryResponse = {
-        answer: educationalAnswer,
-        knowledgeType: 'educational',
-        institutionalSection: null,
-        educationalSection: educationalAnswer,
-        sources: [],
-        retrievalMetadata: retrievalMeta,
-      };
-
-      emit({ type: 'done', response: finalResponse });
-      return finalResponse;
-    }
-
     const instQuery = intent.institutionalSubQuery || query;
     const eduQuery = intent.educationalSubQuery || query;
-    const preloadedInst =
-      instQuery === query
-        ? speculativeRetrieval
-        : collection && indexedDocIds.size > 0
-          ? await vectorRetriever
-              .retrieve({
-                collectionId: collection.id,
-                query: instQuery,
-                topK: DEFAULT_RETRIEVAL_TOP_K,
-                minScore: DEFAULT_MIN_SIMILARITY,
-                preloadedCollection: collection,
-                preloadedIndexedDocIds: indexedDocIds,
-              })
-              .catch(() => undefined)
-          : undefined;
+
+    let preloadedInst: RetrievalResult | undefined;
+    let embedMs = 0;
+    let retrievalMs = 0;
+    let embedCacheHit = false;
+
+    if (collection && indexedDocIds.size > 0) {
+      emit({
+        type: 'status',
+        phase: 'retrieving',
+        message: 'Searching relevant documents',
+      });
+
+      const retrieved = await this.retrieveChunks({
+        query: instQuery,
+        collection,
+        indexedDocIds,
+        signal,
+      });
+      preloadedInst = retrieved.retrieval;
+      embedMs = retrieved.embedMs;
+      retrievalMs = retrieved.retrievalMs;
+      embedCacheHit = retrieved.embedCacheHit;
+    }
 
     emit({
       type: 'meta',
@@ -727,23 +1037,44 @@ export class ActiveRagPipeline implements RagPipeline {
     emit({
       type: 'status',
       phase: 'generating',
-      message: 'Streaming institutional and educational sections...',
+      message: 'Preparing answer',
     });
 
-    const inst = await this.runInstitutionalFlow({
-      query: instQuery,
-      collection,
-      indexedDocIds,
-      history,
-      preloadedRetrieval: preloadedInst,
-      streamTo: (text) => emit({ type: 'chunk', section: 'institutional', text }),
-    });
+    const parallelStart = performance.now();
+    const [inst, educationalAnswer] = await Promise.all([
+      this.runInstitutionalFlow({
+        query: instQuery,
+        collection,
+        indexedDocIds,
+        history,
+        preloadedRetrieval: preloadedInst,
+        streamTo: (text) => emit({ type: 'chunk', section: 'institutional', text }),
+        signal,
+      }),
+      streamEducationalAnswer({
+        query: eduQuery,
+        academicTrack,
+        history,
+        onTextChunk: (text) => emit({ type: 'chunk', section: 'educational', text }),
+        signal,
+      }),
+    ]);
+    const parallelLlmMs = Math.max(
+      inst.llmMs,
+      Math.round(performance.now() - parallelStart),
+    );
 
-    const educationalAnswer = await streamEducationalAnswer({
-      query: eduQuery,
-      academicTrack,
-      history,
-      onTextChunk: (text) => emit({ type: 'chunk', section: 'educational', text }),
+    logRagTiming({
+      mode,
+      route: 'both',
+      streaming: true,
+      totalMs: Math.round(performance.now() - requestStart),
+      routeMs,
+      embedMs: preloadedInst ? embedMs : inst.embedMs,
+      retrievalMs: preloadedInst ? retrievalMs : inst.retrievalMs,
+      llmMs: parallelLlmMs,
+      chunks: inst.retrievedChunks,
+      embedCacheHit: preloadedInst ? embedCacheHit : inst.embedCacheHit,
     });
 
     const combinedMarkdown = [

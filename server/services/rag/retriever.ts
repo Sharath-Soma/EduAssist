@@ -31,6 +31,7 @@ export interface RetrievalRequest {
   minScore?: number;
   preloadedCollection?: InstitutionCollection;
   preloadedIndexedDocIds?: Set<string>;
+  signal?: AbortSignal;
 }
 
 export interface RetrievalResult {
@@ -39,6 +40,9 @@ export interface RetrievalResult {
   chunks: RetrievedChunk[];
   topK: number;
   minScore: number;
+  embedMs: number;
+  vectorSearchMs: number;
+  embedCacheHit: boolean;
 }
 
 export interface VectorRetriever {
@@ -80,11 +84,31 @@ export class CollectionVectorRetriever implements VectorRetriever {
         chunks: [],
         topK,
         minScore,
+        embedMs: 0,
+        vectorSearchMs: 0,
+        embedCacheHit: false,
       };
     }
 
-    const queryEmbedding = await textEmbedder.embedQuery(request.query);
+    let queryEmbedding: number[];
+    let embedMs = 0;
+    let embedCacheHit = false;
 
+    if (textEmbedder.embedQueryWithStats) {
+      const embedResult = await textEmbedder.embedQueryWithStats(
+        request.query,
+        request.signal,
+      );
+      queryEmbedding = embedResult.vector;
+      embedMs = embedResult.durationMs;
+      embedCacheHit = embedResult.cacheHit;
+    } else {
+      const embedStart = performance.now();
+      queryEmbedding = await textEmbedder.embedQuery(request.query, request.signal);
+      embedMs = Math.round(performance.now() - embedStart);
+    }
+
+    const searchStart = performance.now();
     const chunks = await vectorStore.similaritySearch({
       collectionId: collection.id,
       queryEmbedding,
@@ -92,6 +116,7 @@ export class CollectionVectorRetriever implements VectorRetriever {
       minScore,
       allowedDocumentIds,
     });
+    const vectorSearchMs = Math.round(performance.now() - searchStart);
 
     const enrichedChunks = chunks.map((chunk) => ({
       ...chunk,
@@ -104,6 +129,9 @@ export class CollectionVectorRetriever implements VectorRetriever {
       chunks: enrichedChunks,
       topK,
       minScore,
+      embedMs,
+      vectorSearchMs,
+      embedCacheHit,
     };
   }
 }

@@ -187,8 +187,10 @@ export function AssistantWorkspace({
       isStreaming: true,
       statusMessage:
         knowledgeMode === 'educational'
-          ? 'Preparing educational explanation...'
-          : 'Searching institutional documents...',
+          ? 'Preparing answer'
+          : knowledgeMode === 'institutional'
+            ? 'Searching relevant documents'
+            : 'Understanding question',
       mainText: '',
       institutionalText: '',
       educationalText: '',
@@ -423,11 +425,7 @@ export function AssistantWorkspace({
             }
             className="inline-flex min-h-[44px] w-full items-center justify-center gap-2 rounded-lg bg-blue-700 px-5 py-2.5 text-sm font-medium text-white transition-colors hover:bg-blue-800 disabled:cursor-not-allowed disabled:bg-slate-300 whitespace-nowrap shrink-0 sm:w-auto"
           >
-            {isSubmitting ? (
-              <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" />
-            ) : (
-              <Send className="h-4 w-4" aria-hidden="true" />
-            )}
+            {!isSubmitting && <Send className="h-4 w-4" aria-hidden="true" />}
             {isSubmitting ? 'Answering...' : 'Submit Query'}
           </button>
         </div>
@@ -538,15 +536,9 @@ export function AssistantWorkspace({
                           </span>
                         </>
                       ) : (
-                        <>
-                          <Loader2
-                            className="h-4 w-4 animate-spin text-blue-700 shrink-0"
-                            aria-hidden="true"
-                          />
-                          <span className="text-xs font-semibold text-slate-700">
-                            {message.statusMessage ?? 'Preparing response...'}
-                          </span>
-                        </>
+                        <span className="text-xs font-semibold text-slate-600">
+                          EduAssist
+                        </span>
                       )}
                     </div>
 
@@ -572,12 +564,15 @@ export function AssistantWorkspace({
                   </div>
 
                   {!hasAnyStreamText ? (
-                    <div className="flex items-center gap-2.5 py-1 text-sm text-slate-600">
+                    <div
+                      data-testid="assistant-loading-indicator"
+                      className="flex items-center gap-2.5 py-1 text-sm text-slate-600"
+                    >
                       <Loader2
                         className="h-4 w-4 animate-spin text-blue-700 shrink-0"
                         aria-hidden="true"
                       />
-                      <span>{message.statusMessage ?? 'Generating answer...'}</span>
+                      <span>{message.statusMessage ?? 'Understanding question'}</span>
                     </div>
                   ) : hasInstStream || hasEduStream ? (
                     <div className="space-y-5">
@@ -613,12 +608,15 @@ export function AssistantWorkspace({
                   )}
 
                   {hasAnyStreamText && message.isStreaming && (
-                    <div className="flex items-center gap-2 pt-1 text-xs text-slate-500">
+                    <div
+                      data-testid="assistant-loading-indicator"
+                      className="flex items-center gap-2 pt-1 text-xs text-slate-500"
+                    >
                       <Loader2
                         className="h-3.5 w-3.5 animate-spin text-blue-700 shrink-0"
                         aria-hidden="true"
                       />
-                      <span>Streaming response...</span>
+                      <span>{message.statusMessage ?? 'Preparing answer'}</span>
                     </div>
                   )}
                 </article>

@@ -18,6 +18,8 @@ export function isGeminiConfigured(): boolean {
   return Boolean(geminiApiKey && geminiApiKey.trim().length > 0);
 }
 
+export const GEMINI_HTTP_TIMEOUT_MS = 30_000;
+
 export function getGeminiClient(): GoogleGenAI {
   if (cachedClient) {
     return cachedClient;
@@ -31,6 +33,7 @@ export function getGeminiClient(): GoogleGenAI {
   cachedClient = new GoogleGenAI({
     apiKey: geminiApiKey,
     httpOptions: {
+      timeout: GEMINI_HTTP_TIMEOUT_MS,
       headers: {
         'User-Agent': 'aistudio-build',
       },
